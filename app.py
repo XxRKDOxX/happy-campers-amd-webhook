@@ -2,6 +2,16 @@
 """
 Happy Campers Rescue Ranch — AMD Voicemail Webhook Server
 Production deployment for Railway.
+
+Flow:
+  1. Twilio dials the guest with AMD enabled
+  2. /answer fires when call connects → plays a silent pause while AMD analyzes
+  3. /amd-callback fires with the result:
+     - human            → ElevenLabs outbound API initiates a fresh agent call
+     - machine_end_beep → pre-recorded voicemail drop plays
+     - machine_start    → wait for machine_end_* callback
+     - fax/unknown      → hang up
+
 All secrets are loaded from environment variables — never hardcoded.
 """
 
@@ -22,6 +32,7 @@ TWILIO_AUTH_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN")
 FROM_NUMBER         = os.environ.get("FROM_NUMBER", "+13528978771")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY")
 ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID")
+ELEVENLABS_PHONE_ID = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
 VOICEMAIL_AUDIO_URL = os.environ.get("VOICEMAIL_AUDIO_URL")
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
@@ -36,50 +47,38 @@ def health():
 def answer():
     """
     Twilio calls this when the call is answered.
-    Registers the call with ElevenLabs and returns TwiML to connect the agent.
-    AMD runs asynchronously in parallel.
+    We play silence while AMD runs asynchronously in the background.
+    AMD result comes back via /amd-callback.
     """
-    call_sid    = request.form.get("CallSid", "unknown")
-    to_number   = request.form.get("To", "unknown")
-    from_number = request.form.get("From", FROM_NUMBER)
+    call_sid  = request.form.get("CallSid", "unknown")
+    to_number = request.form.get("To", "unknown")
 
-    logger.info(f"📞 Call answered — SID: {call_sid}, To: {to_number}")
+    logger.info(f"📞 Call answered — SID: {call_sid}, To: {to_number} — holding for AMD...")
 
-    try:
-        response = req.post(
-            "https://api.elevenlabs.io/v1/convai/twilio/register-call",
-            headers={
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json"
-            },
-            json={
-                "agent_id": ELEVENLABS_AGENT_ID,
-                "from_number": from_number,
-                "to_number": to_number,
-                "direction": "outbound"
-            },
-            timeout=10
-        )
-
-        if response.status_code == 200:
-            logger.info(f"   ✅ ElevenLabs agent connected for {to_number}")
-            return Response(response.text, mimetype="text/xml")
-        else:
-            logger.error(f"   ❌ ElevenLabs error: {response.status_code} {response.text}")
-
-    except Exception as e:
-        logger.error(f"   ❌ Exception: {e}")
-
-    # Fallback
-    return Response("""<?xml version="1.0" encoding="UTF-8"?>
-<Response><Hangup/></Response>""", mimetype="text/xml")
+    # Play silence while AMD determines human vs machine.
+    # 8 seconds of silence gives AMD time to analyze without dead air being too long.
+    # If AMD fires before this ends, the /amd-callback will redirect the call.
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="8"/>
+    <Hangup/>
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
 
 
 @app.route("/amd-callback", methods=["POST"])
 def amd_callback():
     """
-    Twilio AMD result callback.
-    If voicemail detected, redirect the call to play the pre-recorded drop.
+    Twilio AMD result callback — fires asynchronously after AMD analysis.
+
+    AnsweredBy values:
+      'human'               → real person picked up
+      'machine_start'       → machine detected, waiting for beep
+      'machine_end_beep'    → voicemail beep heard — drop the voicemail
+      'machine_end_silence' → machine finished with silence
+      'machine_end_other'   → machine finished, other sound
+      'fax'                 → fax machine
+      'unknown'             → couldn't determine
     """
     from twilio.rest import Client
 
@@ -89,14 +88,43 @@ def amd_callback():
 
     logger.info(f"🔍 AMD — SID: {call_sid}, To: {to_number}, AnsweredBy: {answered_by}")
 
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
     if answered_by == "human":
-        logger.info(f"✅ Human answered: {to_number}")
+        # Human answered — redirect the active Twilio call to ElevenLabs agent via register-call
+        logger.info(f"✅ Human answered: {to_number} — connecting to ElevenLabs agent")
+        try:
+            # Use ElevenLabs outbound call API to initiate the agent conversation
+            response = req.post(
+                "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+                headers={
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "agent_id": ELEVENLABS_AGENT_ID,
+                    "agent_phone_number_id": ELEVENLABS_PHONE_ID,
+                    "to_number": to_number
+                },
+                timeout=15
+            )
+            if response.status_code == 200:
+                logger.info(f"   ✅ ElevenLabs outbound call initiated for {to_number}")
+                # Hang up the AMD detection call — ElevenLabs will call them back
+                try:
+                    client.calls(call_sid).update(status="completed")
+                except Exception:
+                    pass
+            else:
+                logger.error(f"   ❌ ElevenLabs outbound call failed: {response.status_code} {response.text}")
+        except Exception as e:
+            logger.error(f"   ❌ Exception initiating ElevenLabs call: {e}")
         return "", 204
 
     elif answered_by in ("machine_end_beep", "machine_end_silence", "machine_end_other"):
+        # Voicemail detected — redirect the call to play the pre-recorded voicemail drop
         logger.info(f"📬 Voicemail detected: {to_number} — playing voicemail drop")
         try:
-            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
             client.calls(call_sid).update(
                 twiml=f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -106,17 +134,18 @@ def amd_callback():
             )
             logger.info(f"   ✅ Voicemail drop sent to {to_number}")
         except Exception as e:
-            logger.error(f"   ❌ Failed to redirect: {e}")
+            logger.error(f"   ❌ Failed to redirect to voicemail drop: {e}")
         return "", 204
 
     elif answered_by == "machine_start":
-        logger.info(f"🤖 Machine start detected: {to_number} — waiting for beep")
+        # Still analyzing — Twilio will call back with machine_end_* when done
+        logger.info(f"🤖 Machine start: {to_number} — waiting for beep callback")
         return "", 204
 
     else:
+        # Fax or unknown — hang up cleanly
         logger.info(f"❓ {answered_by}: {to_number} — hanging up")
         try:
-            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
             client.calls(call_sid).update(status="completed")
         except Exception:
             pass
