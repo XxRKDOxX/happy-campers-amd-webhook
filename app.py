@@ -5,9 +5,9 @@ Production deployment for Railway.
 
 Flow:
   1. Twilio dials the guest with AMD enabled
-  2. /answer fires when call connects → plays a silent pause while AMD analyzes
+  2. /answer fires when call connects → stores the To number, plays silence while AMD analyzes
   3. /amd-callback fires with the result:
-     - human            → ElevenLabs outbound API initiates a fresh agent call
+     - human            → ElevenLabs outbound API initiates a fresh agent call to the stored number
      - machine_end_beep → pre-recorded voicemail drop plays
      - machine_start    → wait for machine_end_* callback
      - fax/unknown      → hang up
@@ -35,6 +35,9 @@ ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID")
 ELEVENLABS_PHONE_ID = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
 VOICEMAIL_AUDIO_URL = os.environ.get("VOICEMAIL_AUDIO_URL")
 
+# In-memory store: CallSid -> To number (cleared after AMD callback)
+call_numbers = {}
+
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
@@ -47,17 +50,18 @@ def health():
 def answer():
     """
     Twilio calls this when the call is answered.
-    We play silence while AMD runs asynchronously in the background.
-    AMD result comes back via /amd-callback.
+    Stores the To number keyed by CallSid, then plays silence while AMD runs.
     """
     call_sid  = request.form.get("CallSid", "unknown")
-    to_number = request.form.get("To", "unknown")
+    to_number = request.form.get("To", "")
+
+    # Store the To number so AMD callback can use it
+    if call_sid and to_number:
+        call_numbers[call_sid] = to_number
 
     logger.info(f"📞 Call answered — SID: {call_sid}, To: {to_number} — holding for AMD...")
 
-    # Play silence while AMD determines human vs machine.
-    # 8 seconds of silence gives AMD time to analyze without dead air being too long.
-    # If AMD fires before this ends, the /amd-callback will redirect the call.
+    # Play silence while AMD determines human vs machine (8 seconds max)
     twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Pause length="8"/>
@@ -70,31 +74,33 @@ def answer():
 def amd_callback():
     """
     Twilio AMD result callback — fires asynchronously after AMD analysis.
-
-    AnsweredBy values:
-      'human'               → real person picked up
-      'machine_start'       → machine detected, waiting for beep
-      'machine_end_beep'    → voicemail beep heard — drop the voicemail
-      'machine_end_silence' → machine finished with silence
-      'machine_end_other'   → machine finished, other sound
-      'fax'                 → fax machine
-      'unknown'             → couldn't determine
     """
     from twilio.rest import Client
 
     answered_by = request.form.get("AnsweredBy", "unknown")
     call_sid    = request.form.get("CallSid", "unknown")
-    to_number   = request.form.get("To", "unknown")
+
+    # Retrieve the stored To number for this call
+    to_number = call_numbers.pop(call_sid, None) or request.form.get("To", "")
 
     logger.info(f"🔍 AMD — SID: {call_sid}, To: {to_number}, AnsweredBy: {answered_by}")
 
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
     if answered_by == "human":
-        # Human answered — redirect the active Twilio call to ElevenLabs agent via register-call
-        logger.info(f"✅ Human answered: {to_number} — connecting to ElevenLabs agent")
+        if not to_number:
+            logger.error(f"❌ Human detected but no To number found for SID: {call_sid}")
+            return "", 204
+
+        logger.info(f"✅ Human answered: {to_number} — initiating ElevenLabs agent call")
         try:
-            # Use ElevenLabs outbound call API to initiate the agent conversation
+            # Hang up the AMD detection call first
+            try:
+                client.calls(call_sid).update(status="completed")
+            except Exception:
+                pass
+
+            # Use ElevenLabs outbound call API to call them back with the agent
             response = req.post(
                 "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
                 headers={
@@ -109,20 +115,14 @@ def amd_callback():
                 timeout=15
             )
             if response.status_code == 200:
-                logger.info(f"   ✅ ElevenLabs outbound call initiated for {to_number}")
-                # Hang up the AMD detection call — ElevenLabs will call them back
-                try:
-                    client.calls(call_sid).update(status="completed")
-                except Exception:
-                    pass
+                logger.info(f"   ✅ ElevenLabs agent call initiated to {to_number}")
             else:
-                logger.error(f"   ❌ ElevenLabs outbound call failed: {response.status_code} {response.text}")
+                logger.error(f"   ❌ ElevenLabs call failed: {response.status_code} — {response.text}")
         except Exception as e:
-            logger.error(f"   ❌ Exception initiating ElevenLabs call: {e}")
+            logger.error(f"   ❌ Exception: {e}")
         return "", 204
 
     elif answered_by in ("machine_end_beep", "machine_end_silence", "machine_end_other"):
-        # Voicemail detected — redirect the call to play the pre-recorded voicemail drop
         logger.info(f"📬 Voicemail detected: {to_number} — playing voicemail drop")
         try:
             client.calls(call_sid).update(
@@ -138,8 +138,10 @@ def amd_callback():
         return "", 204
 
     elif answered_by == "machine_start":
-        # Still analyzing — Twilio will call back with machine_end_* when done
         logger.info(f"🤖 Machine start: {to_number} — waiting for beep callback")
+        # Keep the number stored for the follow-up machine_end_* callback
+        if to_number and call_sid:
+            call_numbers[call_sid] = to_number
         return "", 204
 
     else:
@@ -159,6 +161,8 @@ def call_status():
     to       = request.form.get("To", "unknown")
     duration = request.form.get("CallDuration", "0")
     logger.info(f"📋 Call complete — SID: {call_sid}, To: {to}, Status: {status}, Duration: {duration}s")
+    # Clean up any leftover stored numbers
+    call_numbers.pop(call_sid, None)
     return "", 204
 
 
