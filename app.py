@@ -84,11 +84,10 @@ def inbound_fallback():
 
     logger.info(f"🤖 Inbound fallback — SID: {call_sid}, From: {from_number}, DialStatus: {dial_status}")
 
-    # Always connect to Arcadio regardless of DialCallStatus.
+    # Always connect to General Purpose agent regardless of DialCallStatus.
     # 'completed' can mean voicemail answered, not necessarily the owner.
-    # Connect to Arcadio via ElevenLabs register-call
-    agent_id = ELEVENLABS_AGENT_ID
-    logger.info(f"   🤖 Connecting to Arcadio ({agent_id}) for inbound caller {from_number}")
+    agent_id = ELEVENLABS_GENERAL_AGENT_ID or ELEVENLABS_AGENT_ID
+    logger.info(f"   🤖 Connecting to General Purpose agent ({agent_id}) for inbound caller {from_number}")
 
     try:
         response = req.post(
