@@ -55,14 +55,15 @@ def answer():
     Calls ElevenLabs register-call to get TwiML WebSocket stream.
     Returns the TwiML so Arcadio connects on the same call.
     """
-    call_sid  = request.form.get("CallSid", "unknown")
-    to_number = request.form.get("To", "")
+    call_sid    = request.form.get("CallSid", "unknown")
+    to_number   = request.form.get("To", "")
     from_number = request.form.get("From", "")
+    call_reason = request.args.get("call_reason") or request.form.get("call_reason", "")
 
-    logger.info(f"📞 Call answered — SID: {call_sid}, To: {to_number}")
+    logger.info(f"📞 Call answered — SID: {call_sid}, To: {to_number}, Reason: {call_reason or 'none'}")
 
     # Mark as pending AMD result
-    call_status_map[call_sid] = {"to": to_number, "status": "pending"}
+    call_status_map[call_sid] = {"to": to_number, "status": "pending", "call_reason": call_reason}
 
     # Call ElevenLabs register-call to get TwiML for WebSocket stream
     try:
@@ -78,7 +79,9 @@ def answer():
                 "direction": "outbound",
                 "from_number": FROM_NUMBER,
                 "to_number": to_number,
-                "dynamic_variables": {}
+                "dynamic_variables": {
+                    "call_reason": call_reason
+                } if call_reason else {}
             },
             timeout=10
         )
