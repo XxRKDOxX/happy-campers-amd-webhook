@@ -464,33 +464,15 @@ def call_status():
 
 
 def send_recap_sms_delayed(call_sid: str, from_number: str):
-    """Wait for the inbound call to complete by polling Twilio, then send recap SMS."""
+    """Wait a fixed time after the Voicemail Assistant connects, then fetch the latest
+    ElevenLabs conversation and send an email recap. Simple and reliable."""
     import time
-    max_wait = 600  # max 10 minutes
-    poll_interval = 15  # check every 15 seconds
-    waited = 0
-
-    try:
-        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        logger.info(f"   ⏳ Waiting for call {call_sid} to complete...")
-
-        while waited < max_wait:
-            time.sleep(poll_interval)
-            waited += poll_interval
-            try:
-                call = twilio_client.calls(call_sid).fetch()
-                logger.info(f"   📊 Call {call_sid} status: {call.status} (waited {waited}s)")
-                if call.status in ("completed", "failed", "busy", "no-answer", "canceled"):
-                    duration_sec = int(call.duration or 0)
-                    send_recap_sms(call_sid, from_number, duration_sec)
-                    return
-            except Exception as e:
-                logger.warning(f"   ⚠️ Could not poll call status: {e}")
-                break
-
-        logger.warning(f"   ⚠️ Timed out waiting for call {call_sid} to complete")
-    except Exception as e:
-        logger.error(f"   ❌ send_recap_sms_delayed error: {e}")
+    # Wait 3 minutes — enough for most calls to finish and ElevenLabs to save the transcript
+    wait_seconds = 180
+    logger.info(f"   ⏳ Will send recap email in {wait_seconds}s for call from {from_number}")
+    time.sleep(wait_seconds)
+    logger.info(f"   ⏰ Wait complete — fetching transcript for {from_number}")
+    send_recap_sms(call_sid, from_number, 0)
 
 
 def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
