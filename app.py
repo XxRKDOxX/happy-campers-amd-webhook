@@ -18,9 +18,11 @@ All secrets are loaded from environment variables — never hardcoded.
 """
 
 import os
+import json
 import logging
 import requests as req
 from flask import Flask, request, Response
+from twilio.rest import Client as TwilioClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,6 +44,9 @@ OWNER_CELL_NUMBER   = os.environ.get("OWNER_CELL_NUMBER", "+13528970290")    # P
 OWNER_CELL_NUMBER2  = os.environ.get("OWNER_CELL_NUMBER2", "+14074569616")   # Secondary owner number (real cell)
 OWNER_RING_TIMEOUT  = int(os.environ.get("OWNER_RING_TIMEOUT", "10"))        # Seconds to ring owner before Arcadio picks up
 RAILWAY_PUBLIC_URL  = os.environ.get("RAILWAY_PUBLIC_URL", "")               # e.g. https://web-production-c7ecb.up.railway.app
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY")                        # For summarizing transcripts
+SMS_RECAP_TO        = os.environ.get("SMS_RECAP_TO", "+13528970290")          # Number to text call recaps to
+SMS_RECAP_FROM      = os.environ.get("SMS_RECAP_FROM", "+13528978771")        # Twilio number to send SMS from
 
 # In-memory store: CallSid -> status ("human" | "machine" | "pending")
 call_status_map = {}
@@ -286,6 +291,130 @@ def amd_callback():
         if call_sid in call_status_map:
             call_status_map[call_sid]["status"] = "unknown"
         return "", 204
+
+
+@app.route("/call-transcript", methods=["POST"])
+def call_transcript():
+    """
+    ElevenLabs post-call webhook — fires after a Voicemail Assistant call ends.
+    Receives the full conversation transcript, summarizes it with GPT, and texts
+    a recap to the owner at SMS_RECAP_TO.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        logger.info(f"📝 Transcript webhook received — keys: {list(data.keys())}")
+
+        # Extract transcript turns
+        transcript_turns = []
+        conversation = data.get("conversation", {}) or data.get("data", {}) or data
+        messages = (
+            conversation.get("transcript") or
+            conversation.get("messages") or
+            data.get("transcript") or
+            data.get("messages") or []
+        )
+
+        for msg in messages:
+            role = msg.get("role", "unknown").capitalize()
+            text = msg.get("message") or msg.get("content") or msg.get("text") or ""
+            if text.strip():
+                transcript_turns.append(f"{role}: {text.strip()}")
+
+        # Caller phone number
+        caller_number = (
+            data.get("from_number") or
+            data.get("caller") or
+            conversation.get("from_number") or
+            "Unknown"
+        )
+
+        # Call duration
+        duration_sec = (
+            data.get("duration") or
+            conversation.get("duration") or
+            data.get("call_duration") or 0
+        )
+        if duration_sec:
+            mins, secs = divmod(int(duration_sec), 60)
+            duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+        else:
+            duration_str = "unknown"
+
+        if not transcript_turns:
+            logger.info("   ⚠️  No transcript content found — skipping SMS")
+            return "", 204
+
+        full_transcript = "\n".join(transcript_turns)
+        logger.info(f"   📋 Transcript ({len(transcript_turns)} turns) from {caller_number}")
+
+        # Summarize with GPT
+        summary = summarize_transcript(full_transcript, caller_number)
+
+        # Build SMS message
+        sms_body = (
+            f"📞 Voicemail Assistant recap\n"
+            f"From: {caller_number}\n"
+            f"Duration: {duration_str}\n\n"
+            f"{summary}"
+        )
+
+        # Send SMS via Twilio
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = twilio_client.messages.create(
+            body=sms_body[:1600],  # SMS limit
+            from_=SMS_RECAP_FROM,
+            to=SMS_RECAP_TO
+        )
+        logger.info(f"   ✅ Recap SMS sent — SID: {message.sid}")
+
+    except Exception as e:
+        logger.error(f"   ❌ Transcript webhook error: {e}")
+
+    return "", 204
+
+
+def summarize_transcript(transcript: str, caller_number: str) -> str:
+    """Use OpenAI to summarize a call transcript into a short recap."""
+    if not OPENAI_API_KEY:
+        # Fallback: return first 800 chars of raw transcript
+        return transcript[:800]
+
+    try:
+        response = req.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4.1-mini",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a helpful assistant that summarizes phone call transcripts into "
+                            "brief, clear recaps for a business owner. Be concise — 3 to 5 sentences max. "
+                            "Focus on: who called, what they wanted, any key details, and whether a callback is needed."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Summarize this call transcript:\n\n{transcript[:3000]}"
+                    }
+                ],
+                "max_tokens": 200,
+                "temperature": 0.3
+            },
+            timeout=15
+        )
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"].strip()
+        else:
+            logger.error(f"OpenAI error: {response.status_code} — {response.text[:200]}")
+            return transcript[:800]
+    except Exception as e:
+        logger.error(f"OpenAI summarize error: {e}")
+        return transcript[:800]
 
 
 @app.route("/call-status", methods=["POST"])
