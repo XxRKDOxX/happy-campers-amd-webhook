@@ -51,6 +51,9 @@ SMS_RECAP_FROM      = os.environ.get("SMS_RECAP_FROM", "+13528978771")        # 
 # In-memory store: CallSid -> status ("human" | "machine" | "pending")
 call_status_map = {}
 
+# Track inbound call SIDs so we know to send a recap SMS when they end
+inbound_call_sids = set()
+
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
 @app.route("/inbound", methods=["POST"])
@@ -68,11 +71,12 @@ def inbound():
 
     base_url = RAILWAY_PUBLIC_URL.rstrip("/") or "https://web-production-c7ecb.up.railway.app"
     fallback_url = f"{base_url}/inbound-fallback"
+    status_callback_url = f"{base_url}/call-status"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial timeout="{OWNER_RING_TIMEOUT}" action="{fallback_url}" method="POST">
-        <Number>{OWNER_CELL_NUMBER}</Number>
+        <Number statusCallback="{status_callback_url}" statusCallbackEvent="completed">{OWNER_CELL_NUMBER}</Number>
     </Dial>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
@@ -94,6 +98,7 @@ def inbound_fallback():
     # 'completed' can mean voicemail answered, not necessarily the owner.
     agent_id = ELEVENLABS_INBOUND_AGENT_ID or ELEVENLABS_GENERAL_AGENT_ID or ELEVENLABS_AGENT_ID
     logger.info(f"   🤖 Connecting to Voicemail Assistant ({agent_id}) for inbound caller {from_number}")
+    inbound_call_sids.add(call_sid)  # Track so we send a recap SMS when call ends
 
     try:
         response = req.post(
@@ -119,18 +124,34 @@ def inbound_fallback():
 
         if response.status_code == 200:
             content_type = response.headers.get("Content-Type", "")
+            twiml_response = None
             if "xml" in content_type or response.text.strip().startswith("<"):
                 logger.info(f"   ✅ Got TwiML XML from ElevenLabs for inbound {call_sid}")
-                return Response(response.text, mimetype="text/xml")
+                twiml_response = response.text
             else:
                 try:
                     data = response.json()
-                    twiml = data.get("twiml") or data.get("twiML") or data.get("TwiML")
-                    if twiml:
+                    twiml_response = data.get("twiml") or data.get("twiML") or data.get("TwiML")
+                    if twiml_response:
                         logger.info(f"   ✅ Got TwiML from JSON for inbound {call_sid}")
-                        return Response(twiml, mimetype="text/xml")
                 except Exception:
                     pass
+
+            if twiml_response:
+                # Set status callback on the parent call so we know when the conversation ends
+                try:
+                    base_url = RAILWAY_PUBLIC_URL.rstrip("/") or "https://web-production-c7ecb.up.railway.app"
+                    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                    twilio_client.calls(call_sid).update(
+                        status_callback=f"{base_url}/call-status",
+                        status_callback_event=["completed"],
+                        status_callback_method="POST"
+                    )
+                    logger.info(f"   📞 Status callback set for inbound call {call_sid}")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Could not set status callback: {e}")
+                return Response(twiml_response, mimetype="text/xml")
+
         logger.error(f"   ❌ ElevenLabs register-call failed: {response.status_code} — {response.text[:200]}")
 
     except Exception as e:
@@ -419,13 +440,108 @@ def summarize_transcript(transcript: str, caller_number: str) -> str:
 
 @app.route("/call-status", methods=["POST"])
 def call_status():
+    import threading
     call_sid = request.form.get("CallSid", "unknown")
     status   = request.form.get("CallStatus", "unknown")
     to       = request.form.get("To", "unknown")
     duration = request.form.get("CallDuration", "0")
+    from_num = request.form.get("From", "unknown")
     logger.info(f"📋 Call complete — SID: {call_sid}, To: {to}, Status: {status}, Duration: {duration}s")
     call_status_map.pop(call_sid, None)
+
+    # If this was an inbound call handled by the Voicemail Assistant, send a recap SMS
+    if call_sid in inbound_call_sids:
+        inbound_call_sids.discard(call_sid)
+        logger.info(f"📝 Inbound call ended — fetching transcript for recap SMS")
+        # Run in background thread so we don't block Twilio's status callback
+        threading.Thread(
+            target=send_recap_sms,
+            args=(call_sid, from_num, int(duration)),
+            daemon=True
+        ).start()
+
     return "", 204
+
+
+def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
+    """Fetch the most recent Voicemail Assistant conversation transcript and SMS a recap to the owner."""
+    import time
+    # Wait a few seconds for ElevenLabs to finalize the transcript
+    time.sleep(8)
+
+    try:
+        headers = {"xi-api-key": ELEVENLABS_API_KEY}
+        agent_id = ELEVENLABS_INBOUND_AGENT_ID
+
+        # Get the most recent conversation for the Voicemail Assistant agent
+        r = req.get(
+            "https://api.elevenlabs.io/v1/convai/conversations",
+            headers=headers,
+            params={"agent_id": agent_id, "page_size": 1},
+            timeout=15
+        )
+        if r.status_code != 200:
+            logger.error(f"   ❌ Failed to fetch conversations: {r.status_code}")
+            return
+
+        convs = r.json().get("conversations", [])
+        if not convs:
+            logger.warning("   ⚠️ No conversations found for recap")
+            return
+
+        conv_id = convs[0]["conversation_id"]
+        logger.info(f"   📋 Fetching transcript for conversation {conv_id}")
+
+        # Fetch the full conversation transcript
+        r2 = req.get(
+            f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}",
+            headers=headers,
+            timeout=15
+        )
+        if r2.status_code != 200:
+            logger.error(f"   ❌ Failed to fetch conversation detail: {r2.status_code}")
+            return
+
+        conv_data = r2.json()
+        transcript_turns = []
+        for msg in conv_data.get("transcript", []):
+            role = msg.get("role", "unknown").capitalize()
+            text = msg.get("message") or msg.get("content") or msg.get("text") or ""
+            if text.strip():
+                transcript_turns.append(f"{role}: {text.strip()}")
+
+        if not transcript_turns:
+            logger.warning("   ⚠️ Empty transcript — skipping SMS")
+            return
+
+        full_transcript = "\n".join(transcript_turns)
+        logger.info(f"   📋 Got {len(transcript_turns)} transcript turns")
+
+        # Format duration
+        mins, secs = divmod(duration_sec, 60)
+        duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        # Summarize with GPT
+        summary = summarize_transcript(full_transcript, from_number)
+
+        # Build and send SMS
+        sms_body = (
+            f"📞 Voicemail Assistant recap\n"
+            f"From: {from_number}\n"
+            f"Duration: {duration_str}\n\n"
+            f"{summary}"
+        )
+
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = twilio_client.messages.create(
+            body=sms_body[:1600],
+            from_=SMS_RECAP_FROM,
+            to=SMS_RECAP_TO
+        )
+        logger.info(f"   ✅ Recap SMS sent — SID: {message.sid}")
+
+    except Exception as e:
+        logger.error(f"   ❌ send_recap_sms error: {e}")
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
