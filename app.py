@@ -35,6 +35,7 @@ FROM_NUMBER         = os.environ.get("FROM_NUMBER", "+13528978771")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY")
 ELEVENLABS_AGENT_ID         = os.environ.get("ELEVENLABS_AGENT_ID")          # Arcadio — guest outreach
 ELEVENLABS_GENERAL_AGENT_ID = os.environ.get("ELEVENLABS_GENERAL_AGENT_ID")  # General purpose — follows call_reason
+ELEVENLABS_INBOUND_AGENT_ID  = os.environ.get("ELEVENLABS_INBOUND_AGENT_ID")   # Voicemail Assistant — answers inbound calls
 ELEVENLABS_PHONE_ID         = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
 VOICEMAIL_AUDIO_URL = os.environ.get("VOICEMAIL_AUDIO_URL")
 OWNER_CELL_NUMBER   = os.environ.get("OWNER_CELL_NUMBER", "+13528970290")    # Primary owner number (Google Voice)
@@ -84,10 +85,10 @@ def inbound_fallback():
 
     logger.info(f"🤖 Inbound fallback — SID: {call_sid}, From: {from_number}, DialStatus: {dial_status}")
 
-    # Always connect to General Purpose agent regardless of DialCallStatus.
+    # Always connect to Voicemail Assistant (inbound agent) regardless of DialCallStatus.
     # 'completed' can mean voicemail answered, not necessarily the owner.
-    agent_id = ELEVENLABS_GENERAL_AGENT_ID or ELEVENLABS_AGENT_ID
-    logger.info(f"   🤖 Connecting to General Purpose agent ({agent_id}) for inbound caller {from_number}")
+    agent_id = ELEVENLABS_INBOUND_AGENT_ID or ELEVENLABS_GENERAL_AGENT_ID or ELEVENLABS_AGENT_ID
+    logger.info(f"   🤖 Connecting to Voicemail Assistant ({agent_id}) for inbound caller {from_number}")
 
     try:
         response = req.post(
