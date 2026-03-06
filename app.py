@@ -67,7 +67,6 @@ def inbound():
 <Response>
     <Dial timeout="{OWNER_RING_TIMEOUT}" action="{fallback_url}" method="POST" answerOnBridge="true">
         <Number>{OWNER_CELL_NUMBER}</Number>
-        <Number>{OWNER_CELL_NUMBER2}</Number>
     </Dial>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
