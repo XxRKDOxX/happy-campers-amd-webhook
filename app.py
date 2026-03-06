@@ -138,17 +138,14 @@ def inbound_fallback():
                     pass
 
             if twiml_response:
-                # Set status callback on the parent call so we know when the conversation ends
-                try:
-                    base_url = RAILWAY_PUBLIC_URL.rstrip("/") or "https://web-production-c7ecb.up.railway.app"
-                    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                    twilio_client.calls(call_sid).update(
-                        status_callback=f"{base_url}/call-status",
-                        status_callback_method="POST"
-                    )
-                    logger.info(f"   📞 Status callback set for inbound call {call_sid}")
-                except Exception as e:
-                    logger.warning(f"   ⚠️ Could not set status callback: {e}")
+                # Launch background thread to fetch transcript and send recap SMS after call ends
+                import threading
+                threading.Thread(
+                    target=send_recap_sms_delayed,
+                    args=(call_sid, from_number),
+                    daemon=True
+                ).start()
+                logger.info(f"   🕐 Recap SMS thread started for inbound call {call_sid}")
                 return Response(twiml_response, mimetype="text/xml")
 
         logger.error(f"   ❌ ElevenLabs register-call failed: {response.status_code} — {response.text[:200]}")
@@ -460,6 +457,36 @@ def call_status():
         ).start()
 
     return "", 204
+
+
+def send_recap_sms_delayed(call_sid: str, from_number: str):
+    """Wait for the inbound call to complete by polling Twilio, then send recap SMS."""
+    import time
+    max_wait = 600  # max 10 minutes
+    poll_interval = 15  # check every 15 seconds
+    waited = 0
+
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logger.info(f"   ⏳ Waiting for call {call_sid} to complete...")
+
+        while waited < max_wait:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            try:
+                call = twilio_client.calls(call_sid).fetch()
+                logger.info(f"   📊 Call {call_sid} status: {call.status} (waited {waited}s)")
+                if call.status in ("completed", "failed", "busy", "no-answer", "canceled"):
+                    duration_sec = int(call.duration or 0)
+                    send_recap_sms(call_sid, from_number, duration_sec)
+                    return
+            except Exception as e:
+                logger.warning(f"   ⚠️ Could not poll call status: {e}")
+                break
+
+        logger.warning(f"   ⚠️ Timed out waiting for call {call_sid} to complete")
+    except Exception as e:
+        logger.error(f"   ❌ send_recap_sms_delayed error: {e}")
 
 
 def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
