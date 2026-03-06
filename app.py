@@ -65,7 +65,7 @@ def inbound():
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial timeout="{OWNER_RING_TIMEOUT}" action="{fallback_url}" method="POST">
+    <Dial timeout="{OWNER_RING_TIMEOUT}" action="{fallback_url}" method="POST" answerOnBridge="true">
         <Number>{OWNER_CELL_NUMBER}</Number>
         <Number>{OWNER_CELL_NUMBER2}</Number>
     </Dial>
