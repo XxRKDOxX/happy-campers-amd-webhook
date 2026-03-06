@@ -79,9 +79,11 @@ def answer():
                 "direction": "outbound",
                 "from_number": FROM_NUMBER,
                 "to_number": to_number,
-                "dynamic_variables": {
-                    "call_reason": call_reason
-                } if call_reason else {}
+                "conversation_initiation_client_data": {
+                    "dynamic_variables": {
+                        "call_reason": call_reason if call_reason else "standard guest outreach"
+                    }
+                }
             },
             timeout=10
         )
