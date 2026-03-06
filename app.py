@@ -85,12 +85,9 @@ def inbound_fallback():
 
     logger.info(f"🤖 Inbound fallback — SID: {call_sid}, From: {from_number}, DialStatus: {dial_status}")
 
-    # If owner answered, the call is already done — just hang up cleanly
-    if dial_status == "completed":
-        logger.info(f"   ✅ Owner answered — call complete")
-        return Response("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>", mimetype="text/xml")
-
-    # Owner didn't answer — connect to Arcadio via ElevenLabs register-call
+    # Always connect to Arcadio regardless of DialCallStatus.
+    # 'completed' can mean voicemail answered, not necessarily the owner.
+    # Connect to Arcadio via ElevenLabs register-call
     agent_id = ELEVENLABS_AGENT_ID
     logger.info(f"   🤖 Connecting to Arcadio ({agent_id}) for inbound caller {from_number}")
 
