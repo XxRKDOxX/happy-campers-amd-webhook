@@ -37,8 +37,9 @@ ELEVENLABS_AGENT_ID         = os.environ.get("ELEVENLABS_AGENT_ID")          # A
 ELEVENLABS_GENERAL_AGENT_ID = os.environ.get("ELEVENLABS_GENERAL_AGENT_ID")  # General purpose — follows call_reason
 ELEVENLABS_PHONE_ID         = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
 VOICEMAIL_AUDIO_URL = os.environ.get("VOICEMAIL_AUDIO_URL")
-OWNER_CELL_NUMBER   = os.environ.get("OWNER_CELL_NUMBER", "+13528970290")    # Ring owner first on inbound calls
-OWNER_RING_TIMEOUT  = int(os.environ.get("OWNER_RING_TIMEOUT", "20"))        # Seconds to ring owner before Arcadio picks up
+OWNER_CELL_NUMBER   = os.environ.get("OWNER_CELL_NUMBER", "+13528970290")    # Primary owner number (Google Voice)
+OWNER_CELL_NUMBER2  = os.environ.get("OWNER_CELL_NUMBER2", "+14074569616")   # Secondary owner number (real cell)
+OWNER_RING_TIMEOUT  = int(os.environ.get("OWNER_RING_TIMEOUT", "10"))        # Seconds to ring owner before Arcadio picks up
 RAILWAY_PUBLIC_URL  = os.environ.get("RAILWAY_PUBLIC_URL", "")               # e.g. https://web-production-c7ecb.up.railway.app
 
 # In-memory store: CallSid -> status ("human" | "machine" | "pending")
@@ -66,6 +67,7 @@ def inbound():
 <Response>
     <Dial timeout="{OWNER_RING_TIMEOUT}" action="{fallback_url}" method="POST">
         <Number>{OWNER_CELL_NUMBER}</Number>
+        <Number>{OWNER_CELL_NUMBER2}</Number>
     </Dial>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
