@@ -76,6 +76,8 @@ def answer():
                 "agent_id": ELEVENLABS_AGENT_ID,
                 "call_sid": call_sid,
                 "direction": "outbound",
+                "from_number": FROM_NUMBER,
+                "to_number": to_number,
                 "dynamic_variables": {}
             },
             timeout=10
