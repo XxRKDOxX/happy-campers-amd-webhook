@@ -490,10 +490,10 @@ def send_recap_sms_delayed(call_sid: str, from_number: str):
 
 
 def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
-    """Fetch the most recent Voicemail Assistant conversation transcript and SMS a recap to the owner."""
+    """Fetch the ElevenLabs conversation summary and SMS a recap to the owner."""
     import time
-    # Wait a few seconds for ElevenLabs to finalize the transcript
-    time.sleep(8)
+    # Wait for ElevenLabs to finalize the transcript summary
+    time.sleep(10)
 
     try:
         headers = {"xi-api-key": ELEVENLABS_API_KEY}
@@ -515,47 +515,37 @@ def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
             logger.warning("   ⚠️ No conversations found for recap")
             return
 
-        conv_id = convs[0]["conversation_id"]
-        logger.info(f"   📋 Fetching transcript for conversation {conv_id}")
+        conv = convs[0]
+        conv_id = conv["conversation_id"]
+        title = conv.get("call_summary_title", "")
+        caller = conv.get("user_id") or from_number
+        duration_secs = conv.get("call_duration_secs") or duration_sec
+        mins, secs = divmod(int(duration_secs), 60)
+        duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
 
-        # Fetch the full conversation transcript
+        logger.info(f"   📋 Got conversation {conv_id}: '{title}'")
+
+        # Fetch full detail to get transcript_summary
         r2 = req.get(
             f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}",
             headers=headers,
             timeout=15
         )
-        if r2.status_code != 200:
-            logger.error(f"   ❌ Failed to fetch conversation detail: {r2.status_code}")
+        summary = ""
+        if r2.status_code == 200:
+            analysis = r2.json().get("analysis", {})
+            summary = analysis.get("transcript_summary") or ""
+
+        if not summary:
+            logger.warning("   ⚠️ No summary yet — skipping SMS")
             return
-
-        conv_data = r2.json()
-        transcript_turns = []
-        for msg in conv_data.get("transcript", []):
-            role = msg.get("role", "unknown").capitalize()
-            text = msg.get("message") or msg.get("content") or msg.get("text") or ""
-            if text.strip():
-                transcript_turns.append(f"{role}: {text.strip()}")
-
-        if not transcript_turns:
-            logger.warning("   ⚠️ Empty transcript — skipping SMS")
-            return
-
-        full_transcript = "\n".join(transcript_turns)
-        logger.info(f"   📋 Got {len(transcript_turns)} transcript turns")
-
-        # Format duration
-        mins, secs = divmod(duration_sec, 60)
-        duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-
-        # Summarize with GPT
-        summary = summarize_transcript(full_transcript, from_number)
 
         # Build and send SMS
         sms_body = (
-            f"📞 Voicemail Assistant recap\n"
-            f"From: {from_number}\n"
+            f"📞 {title}\n"
+            f"From: {caller}\n"
             f"Duration: {duration_str}\n\n"
-            f"{summary}"
+            f"{summary.strip()}"
         )
 
         twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
