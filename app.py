@@ -37,11 +37,110 @@ ELEVENLABS_AGENT_ID         = os.environ.get("ELEVENLABS_AGENT_ID")          # A
 ELEVENLABS_GENERAL_AGENT_ID = os.environ.get("ELEVENLABS_GENERAL_AGENT_ID")  # General purpose — follows call_reason
 ELEVENLABS_PHONE_ID         = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
 VOICEMAIL_AUDIO_URL = os.environ.get("VOICEMAIL_AUDIO_URL")
+OWNER_CELL_NUMBER   = os.environ.get("OWNER_CELL_NUMBER", "+13528970290")    # Ring owner first on inbound calls
+OWNER_RING_TIMEOUT  = int(os.environ.get("OWNER_RING_TIMEOUT", "20"))        # Seconds to ring owner before Arcadio picks up
+RAILWAY_PUBLIC_URL  = os.environ.get("RAILWAY_PUBLIC_URL", "")               # e.g. https://web-production-c7ecb.up.railway.app
 
 # In-memory store: CallSid -> status ("human" | "machine" | "pending")
 call_status_map = {}
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
+
+@app.route("/inbound", methods=["POST"])
+def inbound():
+    """
+    Twilio calls this when someone calls the business number (352) 897-8771.
+    Rings the owner's cell first for OWNER_RING_TIMEOUT seconds.
+    If unanswered, /inbound-fallback fires and Arcadio picks up.
+    """
+    call_sid    = request.form.get("CallSid", "unknown")
+    from_number = request.form.get("From", "unknown")
+    to_number   = request.form.get("To", FROM_NUMBER)
+
+    logger.info(f"📲 Inbound call — SID: {call_sid}, From: {from_number}")
+
+    base_url = RAILWAY_PUBLIC_URL.rstrip("/") or "https://web-production-c7ecb.up.railway.app"
+    fallback_url = f"{base_url}/inbound-fallback"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial timeout="{OWNER_RING_TIMEOUT}" action="{fallback_url}" method="POST">
+        <Number>{OWNER_CELL_NUMBER}</Number>
+    </Dial>
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
+
+
+@app.route("/inbound-fallback", methods=["POST"])
+def inbound_fallback():
+    """
+    Fires when owner doesn't answer the inbound call within OWNER_RING_TIMEOUT seconds.
+    Connects the caller to Arcadio via ElevenLabs.
+    """
+    call_sid    = request.form.get("CallSid", "unknown")
+    from_number = request.form.get("From", "unknown")
+    dial_status = request.form.get("DialCallStatus", "no-answer")
+
+    logger.info(f"🤖 Inbound fallback — SID: {call_sid}, From: {from_number}, DialStatus: {dial_status}")
+
+    # If owner answered, the call is already done — just hang up cleanly
+    if dial_status == "completed":
+        logger.info(f"   ✅ Owner answered — call complete")
+        return Response("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>", mimetype="text/xml")
+
+    # Owner didn't answer — connect to Arcadio via ElevenLabs register-call
+    agent_id = ELEVENLABS_AGENT_ID
+    logger.info(f"   🤖 Connecting to Arcadio ({agent_id}) for inbound caller {from_number}")
+
+    try:
+        response = req.post(
+            "https://api.elevenlabs.io/v1/convai/twilio/register-call",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "agent_id": agent_id,
+                "call_sid": call_sid,
+                "direction": "inbound",
+                "from_number": from_number,
+                "to_number": FROM_NUMBER,
+                "conversation_initiation_client_data": {
+                    "dynamic_variables": {
+                        "call_reason": "standard guest outreach"
+                    }
+                }
+            },
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            content_type = response.headers.get("Content-Type", "")
+            if "xml" in content_type or response.text.strip().startswith("<"):
+                logger.info(f"   ✅ Got TwiML XML from ElevenLabs for inbound {call_sid}")
+                return Response(response.text, mimetype="text/xml")
+            else:
+                try:
+                    data = response.json()
+                    twiml = data.get("twiml") or data.get("twiML") or data.get("TwiML")
+                    if twiml:
+                        logger.info(f"   ✅ Got TwiML from JSON for inbound {call_sid}")
+                        return Response(twiml, mimetype="text/xml")
+                except Exception:
+                    pass
+        logger.error(f"   ❌ ElevenLabs register-call failed: {response.status_code} — {response.text[:200]}")
+
+    except Exception as e:
+        logger.error(f"   ❌ ElevenLabs register-call exception: {e}")
+
+    # Fallback — play a message if Arcadio can't connect
+    fallback_twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Thanks for calling Happy Campers Rescue Ranch. We're unable to take your call right now. Please try again later.</Say>
+    <Hangup/>
+</Response>"""
+    return Response(fallback_twiml, mimetype="text/xml")
+
 
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
