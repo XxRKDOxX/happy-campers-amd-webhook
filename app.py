@@ -162,14 +162,21 @@ def amd_callback():
             call_status_map[call_sid]["status"] = "machine_start"
         return "", 204
 
-    else:
-        # Fax or unknown — hang up cleanly
-        logger.info(f"❓ {answered_by}: {to_number} — hanging up")
+    elif answered_by == "fax":
+        # Fax — hang up cleanly
+        logger.info(f"📠 Fax detected: {to_number} — hanging up")
         try:
             client.calls(call_sid).update(status="completed")
         except Exception:
             pass
         call_status_map.pop(call_sid, None)
+        return "", 204
+
+    else:
+        # unknown — WebSocket stream is already connected, do nothing
+        logger.info(f"❓ AMD unknown for {to_number} — leaving call connected (Arcadio is streaming)")
+        if call_sid in call_status_map:
+            call_status_map[call_sid]["status"] = "unknown"
         return "", 204
 
 
