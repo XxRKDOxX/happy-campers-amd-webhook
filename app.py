@@ -84,13 +84,23 @@ def answer():
         )
 
         if response.status_code == 200:
-            data = response.json()
-            twiml = data.get("twiml") or data.get("twiML") or data.get("TwiML")
-            if twiml:
-                logger.info(f"   ✅ Got TwiML from ElevenLabs register-call for {call_sid}")
-                return Response(twiml, mimetype="text/xml")
+            content_type = response.headers.get("Content-Type", "")
+            if "xml" in content_type or response.text.strip().startswith("<"):
+                # Response IS the TwiML XML directly
+                logger.info(f"   ✅ Got TwiML XML from ElevenLabs for {call_sid}")
+                return Response(response.text, mimetype="text/xml")
             else:
-                logger.error(f"   ❌ No TwiML in response: {data}")
+                # Try JSON fallback
+                try:
+                    data = response.json()
+                    twiml = data.get("twiml") or data.get("twiML") or data.get("TwiML")
+                    if twiml:
+                        logger.info(f"   ✅ Got TwiML from JSON for {call_sid}")
+                        return Response(twiml, mimetype="text/xml")
+                    else:
+                        logger.error(f"   ❌ No TwiML in JSON response: {data}")
+                except Exception:
+                    logger.error(f"   ❌ Could not parse response: {response.text[:200]}")
         else:
             logger.error(f"   ❌ register-call failed: {response.status_code} — {response.text}")
 
