@@ -20,6 +20,9 @@ All secrets are loaded from environment variables — never hardcoded.
 import os
 import json
 import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import requests as req
 from flask import Flask, request, Response
 from twilio.rest import Client as TwilioClient
@@ -45,8 +48,9 @@ OWNER_CELL_NUMBER2  = os.environ.get("OWNER_CELL_NUMBER2", "+14074569616")   # S
 OWNER_RING_TIMEOUT  = int(os.environ.get("OWNER_RING_TIMEOUT", "10"))        # Seconds to ring owner before Arcadio picks up
 RAILWAY_PUBLIC_URL  = os.environ.get("RAILWAY_PUBLIC_URL", "")               # e.g. https://web-production-c7ecb.up.railway.app
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY")                        # For summarizing transcripts
-SMS_RECAP_TO        = os.environ.get("SMS_RECAP_TO", "+13528970290")          # Number to text call recaps to
-SMS_RECAP_FROM      = os.environ.get("SMS_RECAP_FROM", "+13528978771")        # Twilio number to send SMS from
+EMAIL_RECAP_TO      = os.environ.get("EMAIL_RECAP_TO", "happycampersrescueranch@gmail.com")  # Email to send call recaps to
+GMAIL_USER          = os.environ.get("GMAIL_USER", "happycampersrescueranch@gmail.com")       # Gmail address to send from
+GMAIL_APP_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")                               # Gmail App Password (not account password)
 
 # In-memory store: CallSid -> status ("human" | "machine" | "pending")
 call_status_map = {}
@@ -490,7 +494,7 @@ def send_recap_sms_delayed(call_sid: str, from_number: str):
 
 
 def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
-    """Fetch the ElevenLabs conversation summary and SMS a recap to the owner."""
+    """Fetch the ElevenLabs conversation summary and send an email recap to the owner."""
     import time
     # Wait for ElevenLabs to finalize the transcript summary
     time.sleep(10)
@@ -517,7 +521,7 @@ def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
 
         conv = convs[0]
         conv_id = conv["conversation_id"]
-        title = conv.get("call_summary_title", "")
+        title = conv.get("call_summary_title", "Voicemail Assistant Call")
         caller = conv.get("user_id") or from_number
         duration_secs = conv.get("call_duration_secs") or duration_sec
         mins, secs = divmod(int(duration_secs), 60)
@@ -537,24 +541,46 @@ def send_recap_sms(call_sid: str, from_number: str, duration_sec: int):
             summary = analysis.get("transcript_summary") or ""
 
         if not summary:
-            logger.warning("   ⚠️ No summary yet — skipping SMS")
+            logger.warning("   ⚠️ No summary yet — skipping email")
             return
 
-        # Build and send SMS
-        sms_body = (
-            f"📞 {title}\n"
+        # Build email
+        audio_url = f"https://elevenlabs.io/app/conversational-ai/history/{conv_id}"
+        subject = f"📞 Call Recap: {title}"
+        body_text = (
+            f"Call Recap — Voicemail Assistant\n"
             f"From: {caller}\n"
             f"Duration: {duration_str}\n\n"
-            f"{summary.strip()}"
+            f"Summary:\n{summary.strip()}\n\n"
+            f"Listen to recording:\n{audio_url}"
         )
+        body_html = f"""
+        <html><body>
+        <h2>📞 Call Recap — Voicemail Assistant</h2>
+        <table style='font-family:Arial,sans-serif;font-size:14px'>
+          <tr><td><b>From:</b></td><td>{caller}</td></tr>
+          <tr><td><b>Duration:</b></td><td>{duration_str}</td></tr>
+        </table>
+        <h3>Summary</h3>
+        <p>{summary.strip().replace(chr(10), '<br>')}</p>
+        <h3>Recording</h3>
+        <p><a href='{audio_url}'>▶ Listen to call recording on ElevenLabs</a></p>
+        </body></html>
+        """
 
-        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        message = twilio_client.messages.create(
-            body=sms_body[:1600],
-            from_=SMS_RECAP_FROM,
-            to=SMS_RECAP_TO
-        )
-        logger.info(f"   ✅ Recap SMS sent — SID: {message.sid}")
+        # Send via Gmail SMTP
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = GMAIL_USER
+        msg["To"] = EMAIL_RECAP_TO
+        msg.attach(MIMEText(body_text, "plain"))
+        msg.attach(MIMEText(body_html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            smtp.sendmail(GMAIL_USER, EMAIL_RECAP_TO, msg.as_string())
+
+        logger.info(f"   ✅ Recap email sent to {EMAIL_RECAP_TO} for conversation {conv_id}")
 
     except Exception as e:
         logger.error(f"   ❌ send_recap_sms error: {e}")
