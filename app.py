@@ -144,7 +144,6 @@ def inbound_fallback():
                     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
                     twilio_client.calls(call_sid).update(
                         status_callback=f"{base_url}/call-status",
-                        status_callback_event=["completed"],
                         status_callback_method="POST"
                     )
                     logger.info(f"   📞 Status callback set for inbound call {call_sid}")
