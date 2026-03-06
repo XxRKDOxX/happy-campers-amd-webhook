@@ -33,8 +33,9 @@ TWILIO_ACCOUNT_SID  = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN")
 FROM_NUMBER         = os.environ.get("FROM_NUMBER", "+13528978771")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY")
-ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID")
-ELEVENLABS_PHONE_ID = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
+ELEVENLABS_AGENT_ID         = os.environ.get("ELEVENLABS_AGENT_ID")          # Arcadio — guest outreach
+ELEVENLABS_GENERAL_AGENT_ID = os.environ.get("ELEVENLABS_GENERAL_AGENT_ID")  # General purpose — follows call_reason
+ELEVENLABS_PHONE_ID         = os.environ.get("ELEVENLABS_PHONE_ID", "phnum_4501kjx114q0f8j8cn0c3tt3b0f3")
 VOICEMAIL_AUDIO_URL = os.environ.get("VOICEMAIL_AUDIO_URL")
 
 # In-memory store: CallSid -> status ("human" | "machine" | "pending")
@@ -65,6 +66,11 @@ def answer():
     # Mark as pending AMD result
     call_status_map[call_sid] = {"to": to_number, "status": "pending", "call_reason": call_reason}
 
+    # Route to general-purpose agent if call_reason is provided, otherwise use Arcadio
+    use_general = bool(call_reason and call_reason.strip() and call_reason.strip().lower() != "standard guest outreach")
+    agent_id = (ELEVENLABS_GENERAL_AGENT_ID if use_general else ELEVENLABS_AGENT_ID) or ELEVENLABS_AGENT_ID
+    logger.info(f"   🤖 Using agent: {'General Purpose' if use_general else 'Arcadio'} ({agent_id})")
+
     # Call ElevenLabs register-call to get TwiML for WebSocket stream
     try:
         response = req.post(
@@ -74,7 +80,7 @@ def answer():
                 "Content-Type": "application/json"
             },
             json={
-                "agent_id": ELEVENLABS_AGENT_ID,
+                "agent_id": agent_id,
                 "call_sid": call_sid,
                 "direction": "outbound",
                 "from_number": FROM_NUMBER,
