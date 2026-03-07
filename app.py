@@ -317,82 +317,95 @@ def amd_callback():
 @app.route("/call-transcript", methods=["POST"])
 def call_transcript():
     """
-    ElevenLabs post-call webhook — fires after a Voicemail Assistant call ends.
-    Receives the full conversation transcript, summarizes it with GPT, and texts
-    a recap to the owner at SMS_RECAP_TO.
+    ElevenLabs post-call webhook - fires after every conversation ends.
+    Payload: { "type": "post_call_transcription", "data": { ... } }
+    Sends an email recap to the owner.
     """
     try:
         data = request.get_json(force=True) or {}
-        logger.info(f"📝 Transcript webhook received — keys: {list(data.keys())}")
+        event_type = data.get("type", "")
+        conv_data = data.get("data", {}) or {}
+        logger.info(f"\U0001f4dd ElevenLabs webhook received - type: {event_type}")
 
-        # Extract transcript turns
-        transcript_turns = []
-        conversation = data.get("conversation", {}) or data.get("data", {}) or data
-        messages = (
-            conversation.get("transcript") or
-            conversation.get("messages") or
-            data.get("transcript") or
-            data.get("messages") or []
-        )
-
-        for msg in messages:
-            role = msg.get("role", "unknown").capitalize()
-            text = msg.get("message") or msg.get("content") or msg.get("text") or ""
-            if text.strip():
-                transcript_turns.append(f"{role}: {text.strip()}")
-
-        # Caller phone number
-        caller_number = (
-            data.get("from_number") or
-            data.get("caller") or
-            conversation.get("from_number") or
-            "Unknown"
-        )
-
-        # Call duration
-        duration_sec = (
-            data.get("duration") or
-            conversation.get("duration") or
-            data.get("call_duration") or 0
-        )
-        if duration_sec:
-            mins, secs = divmod(int(duration_sec), 60)
-            duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-        else:
-            duration_str = "unknown"
-
-        if not transcript_turns:
-            logger.info("   ⚠️  No transcript content found — skipping SMS")
+        # Only process transcription events
+        if event_type != "post_call_transcription":
+            logger.info(f"   \u2139\ufe0f  Skipping event type: {event_type}")
             return "", 204
 
-        full_transcript = "\n".join(transcript_turns)
-        logger.info(f"   📋 Transcript ({len(transcript_turns)} turns) from {caller_number}")
+        conv_id = conv_data.get("conversation_id", "unknown")
+        agent_id = conv_data.get("agent_id", "")
+        logger.info(f"   \U0001f4cb Conversation ID: {conv_id}, Agent: {agent_id}")
 
-        # Summarize with GPT
-        summary = summarize_transcript(full_transcript, caller_number)
+        # Only send recap for Voicemail Assistant calls
+        if agent_id != ELEVENLABS_INBOUND_AGENT_ID:
+            logger.info(f"   \u2139\ufe0f  Not a Voicemail Assistant call - skipping recap")
+            return "", 204
 
-        # Build SMS message
-        sms_body = (
-            f"📞 Voicemail Assistant recap\n"
+        # Extract caller number from metadata
+        metadata = conv_data.get("metadata") or {}
+        caller_number = "Unknown"
+        if isinstance(metadata, dict):
+            twilio_meta = metadata.get("twilio") or {}
+            caller_number = twilio_meta.get("from") or metadata.get("from_number") or "Unknown"
+
+        # Duration
+        duration_sec = conv_data.get("call_duration_secs") or 0
+        mins, secs = divmod(int(duration_sec), 60)
+        duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        # Summary from ElevenLabs analysis
+        analysis = conv_data.get("analysis") or {}
+        summary = analysis.get("transcript_summary") or ""
+        title = analysis.get("call_summary_title") or "Voicemail Assistant Call"
+
+        # Fallback: build from raw transcript turns
+        if not summary:
+            turns = []
+            for msg in (conv_data.get("transcript") or []):
+                role = msg.get("role", "unknown").capitalize()
+                text = msg.get("message") or ""
+                if text.strip():
+                    turns.append(f"{role}: {text.strip()}")
+            summary = "\n".join(turns[:20]) if turns else "(no transcript available)"
+
+        audio_url = f"https://elevenlabs.io/app/conversational-ai/history/{conv_id}"
+        subject = f"\U0001f4de Call Recap: {title}"
+
+        body_text = (
+            f"Call Recap - Voicemail Assistant\n"
             f"From: {caller_number}\n"
             f"Duration: {duration_str}\n\n"
-            f"{summary}"
+            f"Summary:\n{summary.strip()}\n\n"
+            f"Listen to recording:\n{audio_url}"
         )
+        body_html = f"""
+        <html><body style='font-family:Arial,sans-serif;font-size:14px'>
+        <h2>\U0001f4de Call Recap - Voicemail Assistant</h2>
+        <table>
+          <tr><td><b>From:</b></td><td>{caller_number}</td></tr>
+          <tr><td><b>Duration:</b></td><td>{duration_str}</td></tr>
+        </table>
+        <h3>Summary</h3>
+        <p>{summary.strip().replace(chr(10), '<br>')}</p>
+        <p><a href='{audio_url}'>&#9654; Listen to call recording on ElevenLabs</a></p>
+        </body></html>
+        """
 
-        # Send SMS via Twilio
-        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        message = twilio_client.messages.create(
-            body=sms_body[:1600],  # SMS limit
-            from_=SMS_RECAP_FROM,
-            to=SMS_RECAP_TO
-        )
-        logger.info(f"   ✅ Recap SMS sent — SID: {message.sid}")
+        email_msg = MIMEMultipart("alternative")
+        email_msg["Subject"] = subject
+        email_msg["From"] = GMAIL_USER
+        email_msg["To"] = EMAIL_RECAP_TO
+        email_msg.attach(MIMEText(body_text, "plain"))
+        email_msg.attach(MIMEText(body_html, "html"))
 
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            smtp.sendmail(GMAIL_USER, EMAIL_RECAP_TO, email_msg.as_string())
+
+        logger.info(f"   \u2705 Recap email sent to {EMAIL_RECAP_TO} - {conv_id}")
     except Exception as e:
-        logger.error(f"   ❌ Transcript webhook error: {e}")
-
+        logger.error(f"   \u274c Transcript webhook error: {e}")
     return "", 204
-
 
 def summarize_transcript(transcript: str, caller_number: str) -> str:
     """Use OpenAI to summarize a call transcript into a short recap."""
